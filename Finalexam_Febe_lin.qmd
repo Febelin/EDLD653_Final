@@ -1,0 +1,328 @@
+---
+title: "EDLD 653 Final Exam"
+author: "Febe Lin"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  cache: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+# Load required packages.
+library(httr)
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(tools)
+library(lme4) 
+library(knitr)
+
+```
+
+# (1) API calls to chess.com (10 points) {#api-calls-to-chess.com-10-points}
+
+```{r}
+
+response <- GET('https://api.chess.com/pub/country/US/players')
+
+player_list <- fromJSON(rawToChar(response$content))$players
+
+players_500 <- player_list[1:500]
+```
+
+```{r}
+
+# Inspect the data structure first, then define the functions
+sample_info_raw <- GET(paste0("https://api.chess.com/pub/player/", players_500[1]))
+sample_info     <- fromJSON(rawToChar(sample_info_raw$content))
+
+sample_stats_raw <- GET(paste0("https://api.chess.com/pub/player/", players_500[1], "/stats"))
+sample_stats     <- fromJSON(rawToChar(sample_stats_raw$content))
+
+str(sample_info, max.level = 3)
+str(sample_stats, max.level = 3)
+```
+
+```{r}
+
+# Helper function: return the value if available; otherwise, return NA.
+# Added with assistance from Gemini to avoid NULL values in the tibble.
+if_null <- function(x, default = NA) {
+  if (is.null(x) || length(x) == 0) default else x
+}
+
+# Define a function to fetch information and stats for one player
+get_more_details <- function(username){
+  Sys.sleep(0.3)   # polite rate -limiting
+  info_raw <- GET(paste0("https://api.chess.com/pub/player/", username))
+  stats_raw <- GET(paste0("https://api.chess.com/pub/player/", username, "/stats"))
+  
+  info <- fromJSON(rawToChar(info_raw$content))
+  stats <- fromJSON(rawToChar(stats_raw$content))
+  
+  # make a tibble to format those info and stats
+  tibble(
+    username          = username,
+    name              = if_null(info$name, NA_character_),
+    followers         = if_null(info$followers, NA_integer_),
+    location          = if_null(info$location, NA_character_),
+    last_online       = as_datetime(if_null(info$last_online, NA_real_), tz = "UTC"),
+    rapid_last_rating = if_null(stats$chess_rapid$last$rating, NA_integer_),
+    rapid_best_rating = if_null(stats$chess_rapid$best$rating, NA_integer_),
+    rapid_record_win  = if_null(stats$chess_rapid$record$win, NA_integer_),
+    rapid_record_loss = if_null(stats$chess_rapid$record$loss, NA_integer_),
+    rapid_record_draw = if_null(stats$chess_rapid$record$draw, NA_integer_)
+  )
+}
+ 
+safe_get <- safely(get_more_details)
+raw_results <- map(players_500, safe_get)
+player_df <- raw_results |>
+  keep(~is.null(.x$error)) |>   
+  map("result") |> 
+  list_rbind()                  
+
+glimpse(player_df)  
+```
+
+# (2) Identify & Remove Duplicate Files (20 points) {#identify-remove-duplicate-files-20-points}
+
+```{r}
+
+q2_location <- "data/question_2"
+
+all_files <- list.files(path = q2_location, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+
+cat("Initial total files detected: ", length(all_files))
+
+# Calculate the MD5 hash for each CSV file and identify duplicate files.
+
+hashes <- tools::md5sum(all_files)
+is_duplicate <- duplicated(hashes)
+
+# The if-else logic was added with assistance from Gemini Fast to improve code robustness when no duplicate files are found (I might re-render several times for checking or revising)
+
+if (any(is_duplicate)) {
+  dup_files  <- all_files[is_duplicate]
+  dup_hashes <- hashes[is_duplicate]  
+  orig_indices <- match(dup_hashes, hashes)
+  orig_files   <- all_files[orig_indices]
+  summary_table <- data.frame(original_file_path = orig_files,deleted_file_path  = dup_files)
+  
+  for (file_to_delete in dup_files) {
+    file.remove(file_to_delete)
+  }} else {summary_table <- data.frame(original_file_path = character(0),deleted_file_path  = character(0))
+}
+
+knitr::kable(summary_table, caption = "Duplicate Files Cleanup Ledger")
+
+
+remaining_files <- list.files(path = q2_location, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+```
+
+```{r}
+cat("Number of duplicate files deleted: ", nrow(summary_table), "\n")
+cat("Number of unique files remaining:  ", length(remaining_files), "\n")
+
+```
+
+# **(3) Multiple Models (10 points)** {#multiple-models-10-points}
+
+First, recode the `season` column to a new column named `wave` so that "fall" has a value of 0, "winter" has a value of 1 and "spring" has a value of 2.
+
+```{r}
+benchmarks <- read_csv("benchmarks.csv")
+
+benchmarks <- benchmarks |>
+  mutate(wave = case_when(season == "fall" ~ 0L, season == "winter" ~ 1L, season == "spring" ~ 2L))
+
+glimpse(benchmarks)
+
+```
+
+```{r}
+
+# this chunk was debug by Gemini Fast model
+slope <- function(df, outcome) {
+  df_score <- df |> rename(score = all_of(outcome))
+  lme_mod <- lmer(score ~ 1 + wave + (1 + wave | sid),REML  = FALSE,data  = df_score)
+  vc_df <- as.data.frame(VarCorr(lme_mod)) # extract the variance and make it a clear data frame
+  true_var <- vc_df |>
+    filter(grp == "sid", var1 == "wave", is.na(var2)) |>
+    pull(vcov) # find out the True Score Variance
+
+  # Denominator part
+  individual_slopes <- df_score |>
+    split(df_score$sid) |> #separate by the sid
+    map_dbl(~coef(lm(score ~ wave, data = .x))["wave"]) #using OLS model
+  obs_var <- var(individual_slopes) #the observed score variance
+  true_var / obs_var #doing the computing
+}
+```
+
+```{r}
+
+results_q3 <- expand_grid(grade = c(3L, 4L, 5L),
+  subject = c("reading", "math")) |>
+  mutate(data = map(grade, ~filter(benchmarks, grade == .x)),slope_reliability = map2_dbl(data, subject, slope)) |>
+  select(-data)
+
+kable(results_q3,digits  = 3,col.names = c("Grade", "Subject", "Slope Reliability"), caption = "Slope reliability by grade and subject")
+```
+
+# **(4) Slope Reliability Function (10 points)** {#slope-reliability-function-10-points}
+
+Write a function that takes an `lmer()` growth model object as its only argument and returns the slope reliability estimate that you just calculated. Make your function as general as possible; that is, it could work on other `lmer()` growth model objects.
+
+Apply your function to the models in the previous question to show that it works, and show the results in a simple table.
+
+```{r}
+slope_reliability_from_lmer <- function(model) {
+  df <- model.frame(model)
+  outcome_var <- names(df)[1]
+  grp_var <- names(getME(model, "cnms"))[1]
+  slope_term  <- getME(model, "cnms")[[grp_var]][2]   
+  # Numerator
+  vc_df    <- as.data.frame(VarCorr(model))
+  true_var <- vc_df |>
+    filter(grp == grp_var, var1 == slope_term, is.na(var2)) |>
+    pull(vcov)
+
+  # Denominator
+  formula_ols  <- as.formula(paste(outcome_var, "~", slope_term))
+  indiv_slopes <- df |>
+    split(df[[grp_var]]) |>
+    keep(~nrow(.x) >= 2) |>
+    map_dbl(~coef(lm(formula_ols, data = .x))[slope_term])
+  obs_var <- var(indiv_slopes)
+  true_var / obs_var
+}
+```
+
+```{r}
+# Refit the six LME models (need the model objects, not just the numbers)
+models_q4 <- expand_grid(grade   = c(3L, 4L, 5L),subject = c("reading", "math")) |>
+  mutate(data  = map(grade, ~filter(benchmarks, grade == .x)),
+    data  = map2(data, subject, ~rename(.x, score = all_of(.y))),
+    model = map(data, ~lmer(score ~ 1 + wave + (1 + wave | sid),REML = FALSE, data = .x)))
+
+# Apply the new general function and compare with Q3 results
+results_q4 <- models_q4 |>
+  mutate(slope_reliability = map_dbl(model, slope_reliability_from_lmer)) |>
+  select(grade, subject, slope_reliability)
+
+kable(results_q4,digits  = 3,col.names = c("Grade", "Subject", "Slope Reliability"),caption = "Slope reliability via slope_reliability_from_lmer()")
+```
+
+# **(5) 95% Confidence Intervals via Bootstrapping (20 pts)** {#question-5-95-confidence-intervals-via-bootstrapping-20-pts}
+
+```{r}
+# Define the bootstrap function.
+# The main structure of this function was developed with assistance from the Gemini Fast model.
+bootstrap_data_simple <- function(df, group_var, n_samples = 100) {
+  unique_ids <- unique(df[[group_var]])
+  n_students <- length(unique_ids)
+  student_list <- split(df, df[[group_var]])
+  
+  samples_list <- vector("list", n_samples)
+  for (i in 1:n_samples) {
+    # Keep the same random draw sequence as the original sample() call
+    sampled_ids <- sample(unique_ids, size = n_students, replace = TRUE)
+    sampled_dfs <- student_list[as.character(sampled_ids)]
+    names(sampled_dfs) <- seq_len(n_students)
+    samples_list[[i]] <- bind_rows(sampled_dfs, .id = group_var)
+  }
+  return(samples_list)
+}
+```
+
+```{r}
+
+slope_reliability_simple <- function(df, group_var, time_var, outcome_var) {
+  
+  formula_lme <- as.formula(paste(outcome_var, "~ 1 +", time_var, "+ (1 +", time_var, "|", group_var, ")"))
+  
+  lme_mod <- suppressMessages(suppressWarnings(lmer(formula_lme, REML = FALSE, data = df)))
+  vc_df <- as.data.frame(VarCorr(lme_mod))
+  
+  # Debugged with assistance from Gemini.
+  # The error was fixed by using vc_df$var1 instead of vc_df$name.
+  true_var <- vc_df$vcov[vc_df$grp == group_var & vc_df$var1 == time_var & is.na(vc_df$var2)]
+  if (length(true_var) == 0) true_var <- 0
+  
+  df_filtered <- df %>%
+    filter(!is.na(.data[[outcome_var]]), !is.na(.data[[time_var]]))
+  
+  slopes_df <- df_filtered %>%
+    group_by(.data[[group_var]]) %>%
+    filter(n() >= 2) %>% # at least have 2 scores
+    summarize(
+      cov_xy = cov(.data[[time_var]], .data[[outcome_var]]),
+      var_x = var(.data[[time_var]]),
+      slope = cov_xy / var_x,
+      .groups = "drop"
+    )
+  
+  obs_var <- var(slopes_df$slope, na.rm = TRUE)
+  return(true_var / obs_var)
+}
+```
+
+```{r}
+library(tidyverse)
+library(lme4)
+
+final_table_data <- tibble()
+grades <- c(3, 4, 5)
+subjects <- c("reading", "math")
+
+set.seed(2653) 
+
+for (g in grades) {
+  for (s in subjects) {
+    sub_data <- benchmarks %>% filter(grade == g)
+    n_students <- length(unique(sub_data$sid))
+    boot_samples <- bootstrap_data_simple(sub_data, group_var = "sid", n_samples = 100)
+    boot_reliabilities <- c() 
+    # This for loop was written with assistance from Gemini
+    for (b in 1:length(boot_samples)) {
+      res <- tryCatch({
+        slope_reliability_simple(boot_samples[[b]], "sid", "wave", s)
+      }, error = function(e) {
+        return(NA)
+      })
+      boot_reliabilities <- c(boot_reliabilities, res)
+    }
+    
+    # Extract clean numeric quantiles to avoid vector naming issues
+    ci_lower  <- as.numeric(quantile(boot_reliabilities, 0.025, na.rm = TRUE))
+    ci_upper  <- as.numeric(quantile(boot_reliabilities, 0.975, na.rm = TRUE))
+    median_sr <- median(boot_reliabilities, na.rm = TRUE)
+    
+    current_row <- tibble(
+      Grade = g,
+      Subject = s,
+      N = n_students,
+      `95% CI Lower` = ci_lower,
+      `95% CI Upper` = ci_upper,
+      `Median Slope Reliability` = median_sr
+    )
+    
+    final_table_data <- bind_rows(final_table_data, current_row)
+  }
+}
+```
+
+```{r}
+knitr::kable(
+  final_table_data, 
+  digits = 3, 
+  caption = "Bootstrapped (n = 100) 95% confidence intervals for slope reliability by grade and subject"
+)
+```
