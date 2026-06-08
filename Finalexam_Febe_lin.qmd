@@ -225,7 +225,7 @@ kable(results_q4,digits  = 3,col.names = c("Grade", "Subject", "Slope Reliabilit
 ```{r}
 # Define the bootstrap function.
 # The main structure of this function was developed with assistance from the Gemini Fast model.
-bootstrap_data_simple <- function(df, group_var, n_samples = 100) {
+bootstrap_data_simple <- function(df, group_var, time_var, outcome_var, n_samples = 100) {
   unique_ids <- unique(df[[group_var]])
   n_students <- length(unique_ids)
   student_list <- split(df, df[[group_var]])
@@ -288,7 +288,7 @@ for (g in grades) {
   for (s in subjects) {
     sub_data <- benchmarks %>% filter(grade == g)
     n_students <- length(unique(sub_data$sid))
-    boot_samples <- bootstrap_data_simple(sub_data, group_var = "sid", n_samples = 100)
+    boot_samples <- bootstrap_data_simple(sub_data, group_var = "sid", time_var = "wave", outcome_var = s, n_samples = 100)
     boot_reliabilities <- c() 
     # This for loop was written with assistance from Gemini
     for (b in 1:length(boot_samples)) {
